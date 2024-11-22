@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from .base import Strategy
-from .ops import inject_noise_to_position, relocate, sample_add
+from .ops import inject_noise_to_position, relocate, sample_add, relocate_intuitive
 
 
 @dataclass
@@ -46,7 +46,7 @@ class MCMCStrategy(Strategy):
 
     """
 
-    cap_max: int = 1_000_000
+    cap_max: int = 2_000_000
     noise_lr: float = 5e5
     refine_start_iter: int = 500
     refine_stop_iter: int = 25_000
@@ -108,6 +108,7 @@ class MCMCStrategy(Strategy):
         step: int,
         info: Dict[str, Any],
         lr: float,
+        tile_loss_info: Dict[str, Any]=None,  
     ):
         """Callback function to be executed after the `loss.backward()` call.
 
@@ -125,7 +126,7 @@ class MCMCStrategy(Strategy):
             and step % self.refine_every == 0
         ):
             # teleport GSs
-            n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
+            n_relocated_gs = self._relocate_gs(params, optimizers, binoms, info, tile_loss_info)
             if self.verbose:
                 print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
 
@@ -150,19 +151,34 @@ class MCMCStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         binoms: Tensor,
+        info: Dict[str, Any],
+        tile_loss_info: Dict[str, Any]=None
     ) -> int:
         opacities = torch.sigmoid(params["opacities"].flatten())
         dead_mask = opacities <= self.min_opacity
         n_gs = dead_mask.sum().item()
-        if n_gs > 0:
-            relocate(
-                params=params,
-                optimizers=optimizers,
-                state={},
-                mask=dead_mask,
-                binoms=binoms,
-                min_opacity=self.min_opacity,
-            )
+        if not tile_loss_info:
+            if n_gs > 0:
+                relocate(
+                    params=params,
+                    optimizers=optimizers,
+                    state={},
+                    mask=dead_mask,
+                    binoms=binoms,
+                    min_opacity=self.min_opacity,
+                )
+        else:
+            if n_gs > 0:
+                relocate_intuitive(
+                    params=params,
+                    optimizers=optimizers,
+                    state={},
+                    mask=dead_mask,
+                    binoms=binoms,
+                    min_opacity=self.min_opacity,
+                    info=info,
+                    tile_loss_info=tile_loss_info,
+                )
         return n_gs
 
     @torch.no_grad()

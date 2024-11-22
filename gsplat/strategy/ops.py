@@ -296,6 +296,98 @@ def relocate(
         if isinstance(v, torch.Tensor):
             v[sampled_idxs] = 0
 
+@torch.no_grad()
+def relocate_intuitive(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    binoms: Tensor,
+    min_opacity: float = 0.005,
+    info: Dict[str, Tensor] = None,
+    tile_loss_info: Dict[str, Tensor] = None,
+):
+    """Inplace relocate some dead Gaussians to the lives ones.
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to indicates which Gaussians are dead.
+        info: Dictionary containing additional information including means2d.
+        tile_loss_info: Dictionary containing tile-wise loss information.
+    """
+    # support "opacities" with shape [N,] or [N, 1]
+    opacities = torch.sigmoid(params["opacities"])
+    device = opacities.device
+
+    dead_indices = mask.nonzero(as_tuple=True)[0]
+    alive_indices = (~mask).nonzero(as_tuple=True)[0]
+    n = len(dead_indices)
+    
+    if n == 0:
+        return
+
+    # Create initial probability distribution from alive Gaussians
+    probs = opacities[alive_indices].flatten()  # ensure its shape is [N,]
+
+    # If tile loss info is provided, modify the probabilities
+    if tile_loss_info is not None and info is not None:
+        coords_top, coords_left, coords_down, coords_right = tile_loss_info['max_tile_coords']
+        flatten_mean2d = info["means2d"].flatten(0, 1)
+        
+        # Create tile mask only for alive Gaussians
+        tile_mask = (
+            (flatten_mean2d[alive_indices, 0] >= coords_left) &
+            (flatten_mean2d[alive_indices, 0] <= coords_right) &
+            (flatten_mean2d[alive_indices, 1] <= coords_top) &
+            (flatten_mean2d[alive_indices, 1] >= coords_down)
+        )
+        
+        # If there are Gaussians in the high-loss tile, prioritize them
+        if tile_mask.any():
+            # Boost probabilities for Gaussians in the high-loss tile
+            boost_factor = 10.0  # Can be adjusted
+            probs = probs.clone()
+            probs[tile_mask] *= boost_factor
+    
+    # Ensure probabilities are valid
+    if probs.sum() == 0:
+        probs = torch.ones_like(probs)
+    probs = probs / probs.sum()
+
+    # Sample indices
+    eps = torch.finfo(torch.float32).eps
+    sampled_idxs = _multinomial_sample(probs, n, replacement=True)
+    sampled_idxs = alive_indices[sampled_idxs]
+
+    # Compute new opacities and scales
+    new_opacities, new_scales = compute_relocation(
+        opacities=opacities[sampled_idxs],
+        scales=torch.exp(params["scales"])[sampled_idxs],
+        ratios=torch.bincount(sampled_idxs, minlength=len(opacities))[sampled_idxs] + 1,
+        binoms=binoms,
+    )
+    new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "opacities":
+            p[sampled_idxs] = torch.logit(new_opacities)
+        elif name == "scales":
+            p[sampled_idxs] = torch.log(new_scales)
+        p[dead_indices] = p[sampled_idxs]
+        return torch.nn.Parameter(p, requires_grad=p.requires_grad)
+
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v[sampled_idxs] = 0
+        return v
+
+    # update the parameters and the state in the optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    # update the extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            v[sampled_idxs] = 0
 
 @torch.no_grad()
 def sample_add(
@@ -367,3 +459,61 @@ def inject_noise_to_position(
     )
     noise = torch.einsum("bij,bj->bi", covars, noise)
     params["means"].add_(noise)
+
+@torch.no_grad()
+def compute_tile_l1_loss(colors: torch.Tensor, pixels: torch.Tensor, tile_size: int = 16) -> dict:
+    """
+    Compute tile-wise L1 losses using vectorized operations.
+    
+    Args:
+        colors: Predicted image tensor of shape [B, H, W, 3]
+        pixels: Ground truth image tensor of shape [B, H, W, 3]
+        tile_size: Size of square tiles (default: 16)
+        
+    Returns:
+        Dictionary containing loss information
+    """
+    B, H, W, C = colors.shape
+    device = colors.device
+    
+    num_tiles_h = H // tile_size
+    num_tiles_w = W // tile_size
+    
+    # Method 1: Using unfold to create tiles
+    # Reshape inputs to [B, C, H, W] for unfold operation
+    colors_bhwc = colors.permute(0, 3, 1, 2)
+    pixels_bhwc = pixels.permute(0, 3, 1, 2)
+    
+    # Create tiles of shape [B, C, num_tiles_h, num_tiles_w, tile_size, tile_size]
+    colors_tiles = colors_bhwc.unfold(2, tile_size, tile_size).unfold(3, tile_size, tile_size)
+    pixels_tiles = pixels_bhwc.unfold(2, tile_size, tile_size).unfold(3, tile_size, tile_size)
+    
+    # Compute L1 loss for each tile
+    # Result shape: [B, num_tiles_h, num_tiles_w]
+    tile_losses = (colors_tiles - pixels_tiles).abs().mean(dim=(1, 4, 5))
+
+    # Find tile with maximum loss
+    max_loss, _ = tile_losses.view(B, -1).max(dim=1)
+    max_loss_indices = torch.where(tile_losses == max_loss.view(-1, 1, 1))
+    max_i, max_j = max_loss_indices[1][0], max_loss_indices[2][0]
+    
+    # Calculate coordinates of max loss tile
+    max_loss_coords = (
+        max_i.item() * tile_size,             # top
+        max_j.item() * tile_size,             # left
+        (max_i.item() + 1) * tile_size,       # bottom
+        (max_j.item() + 1) * tile_size        # right
+    )
+    
+    # Compute overall L1 loss
+    overall_loss = F.l1_loss(colors, pixels)
+    
+    return {
+        'overall_loss': overall_loss.item(),
+        'tile_losses': tile_losses.cpu(),
+        'max_tile_loss': max_loss[0].item(),
+        'max_tile_coords': max_loss_coords,
+        'tile_size': tile_size,
+        'shape': (H, W),
+        'num_tiles': (num_tiles_h, num_tiles_w)
+    }

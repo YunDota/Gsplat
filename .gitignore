@@ -121,7 +121,14 @@ venv.bak/
 compile_commands.json
 *.dump
 
-data
-results
+data/
+results/skin*
+results/church*
+results/garden
+results/bicycle
+results/statue
+results/dtu
+results/candy/appearance
+test_data
 
 !examples/benchmarks/compression/results/

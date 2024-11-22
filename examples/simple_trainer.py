@@ -1,10 +1,13 @@
 import json
 import math
-import os
+import os,sys
 import time
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
+
+project_path = "/home/yun/prjects/gsplat"
+sys.path.append(project_path)
 
 import imageio
 import nerfview
@@ -35,12 +38,15 @@ from lib_bilagrid import (
     color_correct,
     total_variation_loss,
 )
+from Utils.save_ply import save_ply
 
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
+from gsplat.strategy.ops import compute_tile_l1_loss
+
 
 
 @dataclass
@@ -48,16 +54,16 @@ class Config:
     # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
-    ckpt: Optional[List[str]] = None
+    ckpt: Optional[List[str]] = None # field(default_factory=lambda: ["./results/garden/appearance/ckpts/ckpt_4999_rank0.pt"])# None
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
-    render_traj_path: str = "interp"
+    render_traj_path: str = "ellipse" # "interp" "ellipse" "spiral"
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -80,14 +86,14 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 10_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: list(range(5_000, 10_001, 5_000))) #field(default_factory=lambda: [5_000, 10_000]) # Field(default_factory=lambda: list(range(5_000, 100_001, 5_000))
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: list(range(5_000, 10_001, 5_000))) # field(default_factory=lambda: [5_000, 10_000])
 
     # Initialization strategy
-    init_type: str = "sfm"
+    init_type: str = "sfm" # "sfm"
     # Initial number of GSs. Ignored if using sfm
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
@@ -106,12 +112,13 @@ class Config:
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
-    far_plane: float = 1e10
+    far_plane: float = 1e1
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
+
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
     # Use sparse gradients for optimization. (experimental)
@@ -496,6 +503,20 @@ class Runner:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
 
+    @torch.no_grad()
+    def save_for_blender(self, step: int):
+        """Save model with all info plus Blender-compatible colors"""
+        save_dir = f"{self.cfg.result_dir}/blender_export"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        app_module = self.app_module if self.cfg.app_opt else None
+        
+        save_ply(
+            gaussian_data=self.splats,
+            filename=f"{save_dir}/gaussians_{step}.ply",
+            device=self.device
+        )
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -565,7 +586,6 @@ class Runner:
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
-
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -619,6 +639,9 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
+            # bkgd = torch.tensor([[0, 0, 1]], device=device)  # RGB: (135,206,235)
+            # colors = colors + bkgd * (1.0 - alphas)
+
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -630,6 +653,7 @@ class Runner:
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
+            tile_loss_info = None # compute_tile_l1_loss(colors, pixels, tile_size=16)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
@@ -735,6 +759,7 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+                self.save_for_blender(step)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -798,6 +823,7 @@ class Runner:
                     step=step,
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
+                    tile_loss_info = tile_loss_info,
                 )
             else:
                 assert_never(self.cfg.strategy)
@@ -834,6 +860,14 @@ class Runner:
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
+        # trainloader = torch.utils.data.DataLoader(
+        #     self.trainset,
+        #     batch_size=cfg.batch_size,
+        #     shuffle=True,
+        #     num_workers=4,
+        #     persistent_workers=True,
+        #     pin_memory=True,
+        # )
         ellipse_time = 0
         metrics = defaultdict(list)
         for i, data in enumerate(valloader):
@@ -910,10 +944,10 @@ class Runner:
         cfg = self.cfg
         device = self.device
 
-        camtoworlds_all = self.parser.camtoworlds[5:-5]
+        camtoworlds_all = self.parser.camtoworlds #self.parser.camtoworlds[5:-5]
         if cfg.render_traj_path == "interp":
             camtoworlds_all = generate_interpolated_path(
-                camtoworlds_all, 1
+                camtoworlds_all, 3
             )  # [N, 3, 4]
         elif cfg.render_traj_path == "ellipse":
             height = camtoworlds_all[:, 2, 3].mean()
@@ -948,12 +982,12 @@ class Runner:
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}_{cfg.render_traj_path}.mp4", fps=30)
         for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
+            renders, alphas, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -966,6 +1000,7 @@ class Runner:
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
             depths = (depths - depths.min()) / (depths.max() - depths.min())
+            alphas = (alphas - alphas.min()) / (alphas.max() - alphas.min()) 
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
             # write images
@@ -996,6 +1031,7 @@ class Runner:
     def _viewer_render_fn(
         self, camera_state: nerfview.CameraState, img_wh: Tuple[int, int]
     ):
+        
         """Callable function for the viewer."""
         W, H = img_wh
         c2w = camera_state.c2w
@@ -1003,15 +1039,47 @@ class Runner:
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
 
-        render_colors, _, _ = self.rasterize_splats(
+        # # Save original opacities
+        # original_opacities = self.splats["opacities"].clone()
+
+        # # Check base colors of all Gaussians
+        # if self.cfg.app_opt:
+        #     colors = torch.sigmoid(self.splats["colors"])  # [N, 3]
+        # else:
+        #     colors = self.splats["sh0"][:, 0, :]  # [N, 3] - using DC term
+
+        # # Identify blue Gaussians directly
+        # blue_threshold = 0.6
+        # is_blue = (colors[:, 2] > blue_threshold) & (colors[:, 2] > colors[:, 0] * 1.5) & (colors[:, 2] > colors[:, 1] * 1.5)
+        
+        # # Temporarily modify opacities of blue Gaussians
+        # if torch.any(is_blue):
+        #     self.splats["opacities"][is_blue] = float('-inf')
+
+        # # Render with filtered Gaussians
+        # render_colors, render_alphas, _ = self.rasterize_splats(
+        #     camtoworlds=c2w[None],
+        #     Ks=K[None],
+        #     width=W,
+        #     height=H,
+        #     sh_degree=self.cfg.sh_degree,
+        # )
+
+        # # Restore original opacities
+        # self.splats["opacities"].data.copy_(original_opacities)
+        
+        render_colors, render_alphas, _ = self.rasterize_splats(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=W,
             height=H,
             sh_degree=self.cfg.sh_degree,  # active all SH degrees
-            radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
+            #radius_clip=3.0,  # skip GSs that have small image radius (in pixels)
         )  # [1, H, W, 3]
-        return render_colors[0].cpu().numpy()
+        # bkgd = torch.tensor([[0, 0, 1]], device=self.device)  # RGB: (135,206,235)
+        # render_colors = render_colors + bkgd * (1.0 - render_alphas)
+        #render_colors = render_colors * render_alphas + torch.ones_like(render_colors) * (1 - render_alphas)
+        return (render_colors[0].cpu().numpy())
 
 
 def main(local_rank: int, world_rank, world_size: int, cfg: Config):

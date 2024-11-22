@@ -43,9 +43,9 @@ def average_pose(poses: np.ndarray) -> np.ndarray:
 def generate_spiral_path(
     poses,
     bounds,
-    n_frames=120,
+    n_frames=300,
     n_rots=2,
-    zrate=0.5,
+    zrate=0.2,
     spiral_scale_f=1.0,
     spiral_scale_r=1.0,
     focus_distance=0.75,

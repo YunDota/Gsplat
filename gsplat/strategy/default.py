@@ -76,17 +76,17 @@ class DefaultStrategy(Strategy):
 
     """
 
-    prune_opa: float = 0.005
-    grow_grad2d: float = 0.0002
-    grow_scale3d: float = 0.01
-    grow_scale2d: float = 0.05
-    prune_scale3d: float = 0.1
-    prune_scale2d: float = 0.15
+    prune_opa: float = 0.005 # default 0.005
+    grow_grad2d: float = 0.0002 # default 0.0002
+    grow_scale3d: float = 0.01 # default 0.01
+    grow_scale2d: float = 0.05 # default 0.05
+    prune_scale3d: float = 0.1 # default 0.1
+    prune_scale2d: float = 0.15 # default 0.15
     refine_scale2d_stop_iter: int = 0
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 15_000
-    reset_every: int = 3000
-    refine_every: int = 100
+    refine_start_iter: int = 500 # default 500
+    refine_stop_iter: int = 100_000 # default 15_000
+    reset_every: int = 3_000 # default 3_000
+    refine_every: int = 100 # default 100
     pause_refine_after_reset: int = 0
     absgrad: bool = False
     revised_opacity: bool = False
@@ -163,7 +163,6 @@ class DefaultStrategy(Strategy):
             return
 
         self._update_state(params, state, info, packed=packed)
-
         if (
             step > self.refine_start_iter
             and step % self.refine_every == 0

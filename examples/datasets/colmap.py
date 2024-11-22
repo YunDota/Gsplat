@@ -296,7 +296,17 @@ class Parser:
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+
         self.scene_scale = np.max(dists)
+
+        # Interquartile Range (IQR) method
+        # Calculate Q1, Q3, and IQR
+        # q1 = np.percentile(dists, 25)
+        # q3 = np.percentile(dists, 75)
+        # iqr = q3 - q1
+        # self.scene_scale = q3 + iqr/2
+
+        
 
 
 class Dataset:
@@ -330,7 +340,7 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
-
+        image_name = self.parser.image_names[index]
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -355,6 +365,7 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
+            #"image_name" : torch.tensor(image_name),
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
