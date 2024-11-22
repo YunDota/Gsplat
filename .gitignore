@@ -122,14 +122,7 @@ compile_commands.json
 *.dump
 
 data/
-results/skin*
-results/church*
-results/garden
-results/bicycle
-results/statue
-results/dtu
-results/candy/appearance
-results/room
+results/
 docs/
 test_data
 
