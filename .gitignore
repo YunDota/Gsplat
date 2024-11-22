@@ -129,6 +129,8 @@ results/bicycle
 results/statue
 results/dtu
 results/candy/appearance
+results/room
+docs/
 test_data
 
 !examples/benchmarks/compression/results/
